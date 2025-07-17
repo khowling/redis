@@ -15,9 +15,10 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	entraid "github.com/redis/go-redis-entraid"
+	"github.com/redis/go-redis-entraid/identity"
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/auth"
 	"github.com/sirupsen/logrus"
 )
 
@@ -61,12 +62,34 @@ type StreamAddOptions struct {
 // NewRedisConfig creates a new Redis configuration with sensible defaults
 func NewRedisConfig() *RedisConfig {
 	host := os.Getenv("REDIS_HOST")
+	port := 6380
+
+	// Check if REDIS_ENDPOINT is provided (format: host:port)
+	endpoint := os.Getenv("REDIS_ENDPOINT")
+	if endpoint != "" {
+		// Parse endpoint to extract host and port
+		if colon := len(endpoint) - 1; colon > 0 {
+			for i := len(endpoint) - 1; i >= 0; i-- {
+				if endpoint[i] == ':' {
+					host = endpoint[:i]
+					if portStr := endpoint[i+1:]; portStr != "" {
+						if p, err := fmt.Sscanf(portStr, "%d", &port); p == 1 && err == nil {
+							// Port parsed successfully
+						} else {
+							port = 6380 // Default to Azure Redis port
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
 	if host == "" {
 		host = "localhost"
 	}
 
 	// For localhost, use standard Redis port and disable AAD
-	port := 6380
 	useAAD := true
 	if host == "localhost" {
 		port = 6379    // Standard Redis port for localhost
@@ -120,13 +143,15 @@ func NewAzureRedisClient(config *RedisConfig) (*AzureRedisClient, error) {
 		opts.TLSConfig = &tls.Config{ServerName: config.Host}
 	}
 
-	// Use Azure AD authentication if enabled
+	// Use Azure AD authentication with managed identity if enabled
 	if config.UseAAD {
-		token, err := getAzureADToken()
+		provider, err := createManagedIdentityProvider()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get Azure AD token: %w", err)
+			return nil, fmt.Errorf("failed to create managed identity provider: %w", err)
 		}
-		opts.Password = token
+		opts.StreamingCredentialsProvider = provider
+		// Don't set password when using streaming credentials
+		opts.Password = ""
 	}
 
 	client := redis.NewClient(opts)
@@ -153,25 +178,32 @@ func NewAzureRedisClient(config *RedisConfig) (*AzureRedisClient, error) {
 	}, nil
 }
 
-// getAzureADToken retrieves an Azure AD token for Redis authentication
-func getAzureADToken() (string, error) {
-	// Use DefaultAzureCredential for authentication
-	// This will try Managed Identity first, then fall back to other methods
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create Azure credential: %w", err)
-	}
+// createManagedIdentityProvider creates a managed identity credentials provider
+func createManagedIdentityProvider() (auth.StreamingCredentialsProvider, error) {
+	// Check if we have a specific client ID for user-assigned managed identity
+	clientID := os.Getenv("AZURE_CLIENT_ID")
 
-	// Get token for Azure Redis scope
-	tokenRequestOptions := policy.TokenRequestOptions{
-		Scopes: []string{"https://redis.azure.com/.default"},
+	if clientID != "" {
+		// Use user-assigned managed identity with client ID
+		// Note: For Azure Redis, the client ID is used as the UserAssignedObjectID
+		return entraid.NewManagedIdentityCredentialsProvider(
+			entraid.ManagedIdentityCredentialsProviderOptions{
+				ManagedIdentityProviderOptions: identity.ManagedIdentityProviderOptions{
+					ManagedIdentityType:  "UserAssignedObjectID",
+					UserAssignedObjectID: clientID,
+				},
+			},
+		)
+	} else {
+		// Fall back to system-assigned managed identity
+		return entraid.NewManagedIdentityCredentialsProvider(
+			entraid.ManagedIdentityCredentialsProviderOptions{
+				ManagedIdentityProviderOptions: identity.ManagedIdentityProviderOptions{
+					ManagedIdentityType: identity.SystemAssignedIdentity,
+				},
+			},
+		)
 	}
-	token, err := cred.GetToken(context.Background(), tokenRequestOptions)
-	if err != nil {
-		return "", fmt.Errorf("failed to get token: %w", err)
-	}
-
-	return token.Token, nil
 }
 
 // AddToStream adds a message to a Redis stream with error handling and retry logic

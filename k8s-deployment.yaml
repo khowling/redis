@@ -1,0 +1,143 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-stream-app
+  labels:
+    app: redis-stream-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-stream-app
+  template:
+    metadata:
+      labels:
+        app: redis-stream-app
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: redis-stream-app-sa
+      containers:
+      - name: redis-stream-app
+        image: redis-stream-app:latest
+        ports:
+        - containerPort: 8080
+        env:
+        # Redis Configuration for Azure Managed Redis with Managed Identity
+        - name: REDIS_ENDPOINT
+          value: "khredis.westeurope.redis.azure.net:10000" # Azure Redis endpoint from portal
+        - name: REDIS_USE_AAD
+          value: "true"
+        
+        # Environment Configuration
+        - name: ENVIRONMENT
+          value: "production"
+        
+        # Redis Connection Pool Settings
+        - name: REDIS_MAX_RETRIES
+          value: "3"
+        - name: REDIS_POOL_SIZE
+          value: "10"
+        - name: REDIS_DIAL_TIMEOUT
+          value: "5s"
+        
+        # Azure Managed Identity Configuration
+        - name: AZURE_CLIENT_ID
+          value: "e5833ec1-dc2b-471c-a883-a9e8544b2efa" # User Managed Identity Client ID
+        - name: AZURE_TENANT_ID
+          value: "MngEnvMCAP134668.onmicrosoft.com" # Replace with your Azure Tenant ID
+        
+        # Managed Identity Object ID for Redis ACL (used as username in Redis connection)
+        - name: REDIS_USERNAME
+          value: "7303e014-4009-403f-b170-83ef57374e21" # Object ID of your managed identity
+
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        
+        # Volume mounts for workload identity
+        volumeMounts:
+        - name: azure-identity-token
+          mountPath: /var/run/secrets/azure/tokens
+          readOnly: true
+      
+      volumes:
+      - name: azure-identity-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: azure-identity-token
+              expirationSeconds: 3600
+              audience: api://AzureADTokenExchange
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-stream-app-service
+  labels:
+    app: redis-stream-app
+spec:
+  selector:
+    app: redis-stream-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-stream-app-sa
+  annotations:
+    azure.workload.identity/client-id: "e5833ec1-dc2b-471c-a883-a9e8544b2efa" # User Managed Identity Client ID
+  labels:
+    azure.workload.identity/use: "true"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-stream-app-config
+data:
+  ENVIRONMENT: "production"
+  REDIS_USE_AAD: "true"
+  REDIS_MAX_RETRIES: "3"
+  REDIS_POOL_SIZE: "10"
+  REDIS_DIAL_TIMEOUT: "5s"
+  REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"
