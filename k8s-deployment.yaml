@@ -5,7 +5,7 @@ metadata:
   labels:
     app: redis-stream-app
 spec:
-  replicas: 1
+  replicas: 5
   selector:
     matchLabels:
       app: redis-stream-app
@@ -17,32 +17,46 @@ spec:
     spec:
       serviceAccountName: redis-stream-app-sa
       containers:
-      - name: redis-stream-app
-        image: redis-stream-app:latest
+      - name: redis-client
+        image: kharc.azurecr.io/redis-client:0.9-arm64-with-health # Optimized for AKS performance + health checks
         ports:
         - containerPort: 8080
         env:
-        # Redis Configuration for Azure Managed Redis with Managed Identity
-        - name: REDIS_ENDPOINT
-          value: "khredis.westeurope.redis.azure.net:10000" # Azure Redis endpoint from portal
-        - name: REDIS_USE_AAD
-          value: "true"
-        
-        # Environment Configuration
+        # Load common configuration from ConfigMap
         - name: ENVIRONMENT
-          value: "production"
-        
-        # Redis Connection Pool Settings
+          valueFrom:
+            configMapKeyRef:
+              name: redis-stream-app-config
+              key: ENVIRONMENT
+        - name: REDIS_USE_AAD
+          valueFrom:
+            configMapKeyRef:
+              name: redis-stream-app-config
+              key: REDIS_USE_AAD
+        - name: REDIS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: redis-stream-app-config
+              key: REDIS_ENDPOINT
         - name: REDIS_MAX_RETRIES
-          value: "3"
+          valueFrom:
+            configMapKeyRef:
+              name: redis-stream-app-config
+              key: REDIS_MAX_RETRIES
         - name: REDIS_POOL_SIZE
-          value: "10"
+          valueFrom:
+            configMapKeyRef:
+              name: redis-stream-app-config
+              key: REDIS_POOL_SIZE
         - name: REDIS_DIAL_TIMEOUT
-          value: "5s"
+          valueFrom:
+            configMapKeyRef:
+              name: redis-stream-app-config
+              key: REDIS_DIAL_TIMEOUT
         
-        # Azure Managed Identity Configuration
+        # Azure Managed Identity Configuration (secrets, keep as env vars)
         - name: AZURE_CLIENT_ID
-          value: "e5833ec1-dc2b-471c-a883-a9e8544b2efa" # User Managed Identity Client ID
+          value: "7303e014-4009-403f-b170-83ef57374e21" # User Managed Identity Object ID (required for Azure Redis auth)
         - name: AZURE_TENANT_ID
           value: "MngEnvMCAP134668.onmicrosoft.com" # Replace with your Azure Tenant ID
         
@@ -52,11 +66,8 @@ spec:
 
         resources:
           requests:
-            memory: "64Mi"
-            cpu: "250m"
-          limits:
             memory: "128Mi"
-            cpu: "500m"
+            cpu: "1000m"
         
         # Health checks
         livenessProbe:
@@ -138,6 +149,6 @@ data:
   ENVIRONMENT: "production"
   REDIS_USE_AAD: "true"
   REDIS_MAX_RETRIES: "3"
-  REDIS_POOL_SIZE: "10"
+  REDIS_POOL_SIZE: "50"
   REDIS_DIAL_TIMEOUT: "5s"
   REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"

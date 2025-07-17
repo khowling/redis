@@ -96,21 +96,45 @@ func NewRedisConfig() *RedisConfig {
 		useAAD = false // Disable Azure AD for localhost
 	}
 
+	// Parse pool size from environment with default
+	poolSize := 50
+	if poolSizeStr := os.Getenv("REDIS_POOL_SIZE"); poolSizeStr != "" {
+		if ps, err := fmt.Sscanf(poolSizeStr, "%d", &poolSize); ps != 1 || err != nil {
+			poolSize = 50 // Default value
+		}
+	}
+
+	// Parse max retries from environment with default
+	maxRetries := 3
+	if maxRetriesStr := os.Getenv("REDIS_MAX_RETRIES"); maxRetriesStr != "" {
+		if mr, err := fmt.Sscanf(maxRetriesStr, "%d", &maxRetries); mr != 1 || err != nil {
+			maxRetries = 3 // Default value
+		}
+	}
+
+	// Parse dial timeout from environment with default
+	dialTimeout := 5 * time.Second
+	if dialTimeoutStr := os.Getenv("REDIS_DIAL_TIMEOUT"); dialTimeoutStr != "" {
+		if dt, err := time.ParseDuration(dialTimeoutStr); err == nil {
+			dialTimeout = dt
+		}
+	}
+
 	return &RedisConfig{
 		Host:          host,
 		Port:          port,
 		Username:      os.Getenv("REDIS_USERNAME"),
 		UseAAD:        useAAD,
-		MaxRetries:    3,
-		DialTimeout:   5 * time.Second,
-		ReadTimeout:   3 * time.Second,
-		WriteTimeout:  3 * time.Second,
-		PoolSize:      10,
-		MinIdleConns:  5,
+		MaxRetries:    maxRetries,
+		DialTimeout:   dialTimeout,
+		ReadTimeout:   2 * time.Second, // Reduced for faster operations
+		WriteTimeout:  2 * time.Second, // Reduced for faster operations
+		PoolSize:      poolSize,        // Now configurable via environment
+		MinIdleConns:  poolSize / 3,    // Dynamic based on pool size
 		MaxConnAge:    30 * time.Minute,
-		PoolTimeout:   4 * time.Second,
-		IdleTimeout:   5 * time.Minute,
-		IdleCheckFreq: 1 * time.Minute,
+		PoolTimeout:   2 * time.Second,  // Reduced timeout for faster failover
+		IdleTimeout:   3 * time.Minute,  // Reduced idle timeout
+		IdleCheckFreq: 30 * time.Second, // Less frequent idle checks
 	}
 }
 
@@ -184,13 +208,14 @@ func createManagedIdentityProvider() (auth.StreamingCredentialsProvider, error) 
 	clientID := os.Getenv("AZURE_CLIENT_ID")
 
 	if clientID != "" {
-		// Use user-assigned managed identity with client ID
-		// Note: For Azure Redis, the client ID is used as the UserAssignedObjectID
+		// Use user-assigned managed identity with object ID
+		// Note: We're using the Object ID which should be provided in AZURE_CLIENT_ID
+		// Based on the error logs, the Object ID is: 7303e014-4009-403f-b170-83ef57374e21
 		return entraid.NewManagedIdentityCredentialsProvider(
 			entraid.ManagedIdentityCredentialsProviderOptions{
 				ManagedIdentityProviderOptions: identity.ManagedIdentityProviderOptions{
 					ManagedIdentityType:  "UserAssignedObjectID",
-					UserAssignedObjectID: clientID,
+					UserAssignedObjectID: clientID, // This should actually be the Object ID
 				},
 			},
 		)
@@ -204,9 +229,7 @@ func createManagedIdentityProvider() (auth.StreamingCredentialsProvider, error) 
 			},
 		)
 	}
-}
-
-// AddToStream adds a message to a Redis stream with error handling and retry logic
+} // AddToStream adds a message to a Redis stream with error handling and retry logic
 func (c *AzureRedisClient) AddToStream(ctx context.Context, streamName string, message StreamMessage, options *StreamAddOptions) (string, error) {
 	if streamName == "" {
 		return "", fmt.Errorf("stream name cannot be empty")
@@ -467,6 +490,7 @@ type StreamingStats struct {
 	MessagesPerSecond float64
 	StartTime         time.Time
 	Errors            int64
+	StreamLength      int64
 }
 
 // Update updates the statistics
@@ -482,11 +506,18 @@ func (s *StreamingStats) Update(messages int64, batches int64, errors int64) {
 	}
 }
 
+// UpdateStreamLength updates the current stream length
+func (s *StreamingStats) UpdateStreamLength(length int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.StreamLength = length
+}
+
 // GetStats returns current statistics
-func (s *StreamingStats) GetStats() (int64, int64, float64, int64) {
+func (s *StreamingStats) GetStats() (int64, int64, float64, int64, int64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.TotalMessages, s.TotalBatches, s.MessagesPerSecond, s.Errors
+	return s.TotalMessages, s.TotalBatches, s.MessagesPerSecond, s.Errors, s.StreamLength
 }
 
 // StartHighPerformanceStreaming starts continuous message streaming with batching
@@ -505,6 +536,9 @@ func (c *AzureRedisClient) StartHighPerformanceStreaming(ctx context.Context, co
 
 	// Start message generator
 	go c.messageGenerator(ctx, messageChan, config, stats)
+
+	// Start stream length monitor
+	go c.streamLengthMonitor(ctx, stats)
 
 	// Start batch processors
 	var wg sync.WaitGroup
@@ -645,6 +679,32 @@ func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage
 	}
 }
 
+// streamLengthMonitor monitors the stream length periodically
+func (c *AzureRedisClient) streamLengthMonitor(ctx context.Context, stats *StreamingStats) {
+	ticker := time.NewTicker(5 * time.Second) // Check stream length every 5 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Get stream info to retrieve length
+			streamInfo, err := c.GetStreamInfo(ctx, "trade_events")
+			if err != nil {
+				// Log error but continue monitoring
+				c.logger.WithFields(logrus.Fields{
+					"error": err,
+				}).Warn("Failed to get stream info")
+				continue
+			}
+
+			// Update stats with current stream length
+			stats.UpdateStreamLength(streamInfo.Length)
+		}
+	}
+}
+
 // statsReporter reports statistics periodically
 func (c *AzureRedisClient) statsReporter(ctx context.Context, stats *StreamingStats, doneChan chan<- struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
@@ -656,11 +716,11 @@ func (c *AzureRedisClient) statsReporter(ctx context.Context, stats *StreamingSt
 			doneChan <- struct{}{}
 			return
 		case <-ticker.C:
-			messages, batches, rate, errors := stats.GetStats()
+			messages, batches, rate, errors, streamLength := stats.GetStats()
 			// Print statistics directly to stdout (not through logger) to avoid log level issues
-			fmt.Printf("📊 [%s] Messages: %d | Batches: %d | Rate: %.2f msg/sec | Errors: %d | Uptime: %s\n",
+			fmt.Printf("📊 [%s] Messages: %d | Batches: %d | Rate: %.2f msg/sec | Errors: %d | Stream: %d | Uptime: %s\n",
 				time.Now().Format("15:04:05"),
-				messages, batches, rate, errors,
+				messages, batches, rate, errors, streamLength,
 				time.Since(stats.StartTime).Round(time.Second),
 			)
 		}
@@ -723,11 +783,16 @@ func main() {
 	}
 	defer client.Close()
 
-	// Configure high-performance streaming
+	// Start health check server
+	healthChecker := NewHealthChecker(client, 30*time.Second)
+	StartHealthServer(healthChecker, 8080)
+	log.Printf("🏥 Health check server started on port 8080")
+
+	// Configure high-performance streaming for AKS
 	streamingConfig := NewStreamingConfig()
-	streamingConfig.BatchSize = 20                        // Batch 20 messages together
-	streamingConfig.FlushInterval = 25 * time.Millisecond // Flush every 25ms
-	streamingConfig.WorkerCount = 8                       // 8 concurrent workers
+	streamingConfig.BatchSize = 100                       // Larger batches for better throughput
+	streamingConfig.FlushInterval = 50 * time.Millisecond // Less frequent flushes, larger batches
+	streamingConfig.WorkerCount = 16                      // More workers for AKS resources
 	streamingConfig.MessageRate = 0                       // Unlimited rate
 	streamingConfig.RunDuration = 0                       // Run indefinitely
 

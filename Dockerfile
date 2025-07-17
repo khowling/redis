@@ -16,8 +16,8 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+# Build the application - cross-compile for ARM64
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o main .
 
 # Final stage
 FROM alpine:latest
@@ -34,6 +34,9 @@ WORKDIR /app
 
 # Copy binary from builder stage
 COPY --from=builder /app/main .
+
+# Copy test data file
+COPY --from=builder /app/test_message.json .
 
 # Change ownership to non-root user
 RUN chown -R appuser:appgroup /app

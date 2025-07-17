@@ -4,7 +4,17 @@ A robust Go client for Azure Managed Redis that provides secure stream operation
 
 ## Features
 
-- **Azure AD Authentication**: Uses managed identity for secure authentication
+- **Azure AD Authentication**## Build
+
+Build and push to Azure Container Registry (ACR uses native ARM64 builders):
+
+```bash
+# Native ARM64 build - no cross-compilation needed
+az acr build --registry kharc --image redis-client:0.3-arm64-native --platform linux/arm64 .
+
+# Alternative with version tag
+az acr build --registry kharc --image redis-client:latest --platform linux/arm64 .
+```s managed identity for secure authentication
 - **Stream Operations**: Add single messages, batch messages, and retrieve stream information
 - **Retry Logic**: Exponential backoff retry mechanism for transient failures
 - **Connection Pooling**: Optimized connection management for better performance
@@ -252,3 +262,11 @@ For issues and questions:
 - [Azure SDK for Go](https://github.com/Azure/azure-sdk-for-go)
 - [Redis Streams Documentation](https://redis.io/docs/data-types/streams/)
 - [Go Redis Client](https://github.com/go-redis/redis)
+
+
+
+## Build
+
+```
+az acr build --registry kharc --image redis-client:0.3-arm64-native --platform linux/arm64 . 
+```
