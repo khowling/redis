@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  redis-client:
+    build: .
+    environment:
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_USERNAME=${REDIS_USERNAME}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+    depends_on:
+      - redis-local
+    networks:
+      - redis-network
+
+  # Local Redis instance for development/testing
+  redis-local:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - redis-network
+
+  # Redis Commander for GUI management
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis-local:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis-local
+    networks:
+      - redis-network
+
+volumes:
+  redis_data:
+
+networks:
+  redis-network:
+    driver: bridge
