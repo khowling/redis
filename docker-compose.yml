@@ -1,14 +1,35 @@
 version: '3.8'
 
 services:
-  redis-client:
-    build: .
+  # Redis Streamer (Producer)
+  redis-streamer:
+    build: 
+      context: ./streamer
+      dockerfile: Dockerfile
     environment:
-      - REDIS_HOST=${REDIS_HOST}
-      - REDIS_USERNAME=${REDIS_USERNAME}
-      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
-      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
-      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - REDIS_HOST=redis-local
+      - REDIS_USERNAME=${REDIS_USERNAME:-}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID:-}
+      - REDIS_POOL_SIZE=50
+      - REDIS_MAX_RETRIES=3
+    depends_on:
+      - redis-local
+    networks:
+      - redis-network
+
+  # Redis Query API (Consumer)
+  redis-query-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_HOST=redis-local
+      - REDIS_USERNAME=${REDIS_USERNAME:-}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID:-}
+      - REDIS_POOL_SIZE=20
+      - REDIS_MAX_RETRIES=3
+    ports:
+      - "8081:8081"
     depends_on:
       - redis-local
     networks:
@@ -25,13 +46,13 @@ services:
     networks:
       - redis-network
 
-  # Redis Commander for GUI management
+  # Redis Commander for GUI management (moved to different port)
   redis-commander:
     image: rediscommander/redis-commander:latest
     environment:
       - REDIS_HOSTS=local:redis-local:6379
     ports:
-      - "8081:8081"
+      - "8082:8081"
     depends_on:
       - redis-local
     networks:

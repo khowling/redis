@@ -1,12 +1,75 @@
-# Azure Managed Redis Go Client for Stream Operations
+# Redis Streaming Platform
 
-A robust Go client for Azure Managed Redis that provides secure stream operations with Azure AD authentication, retry logic, and comprehensive error handling.
+A high-performance Redis streaming platform for UK stock market data with REST API access.
 
-## Features
+## 🏗️ Project Structure
 
-- **Azure AD Authentication**
+```
+redis/
+├── streamer/          # Main streaming application (writes to Redis)
+│   ├── main.go        # High-performance Redis stream writer
+│   ├── config.go      # Redis configuration
+│   ├── health.go      # Health monitoring
+│   ├── go.mod         # Module: redis-streamer
+│   ├── test_message.json
+│   └── uk_symbols.txt # 87 UK stock symbols
+├── api/               # REST API server (reads from Redis)
+│   ├── main.go        # HTTP API server
+│   ├── redis.go       # Redis client for API
+│   └── go.mod         # Module: redis-query-api
+├── scripts/           # Monitoring and utility scripts
+├── k8s-*.yaml         # Kubernetes deployment files
+├── docker-compose.yml # Docker setup
+├── Dockerfile         # Container image
+└── README.md          # This file
+```
+
+## 🚀 Quick Start
+
+### 1. Start Redis Streaming (Producer)
+```bash
+cd streamer
+REDIS_HOST=localhost go run .
+```
+
+### 2. Start API Server (Consumer)
+```bash
+cd api
+REDIS_HOST=localhost go run .
+```
+
+### 3. Query the API
+```bash
+# Get stream list
+curl http://localhost:8081/api/streams
+
+# Query messages
+curl "http://localhost:8081/api/messages?symbols=AAL,BP&limit=10"
+
+# Health check
+curl http://localhost:8081/health
+```
 
 ## Build
+
+Locally
+
+```bash
+go build -o redis-client .
+
+```
+
+test
+```bash
+ redis-cli --scan --pattern "tick_*" | head -10
+
+ redis-cli --scan --pattern "tick_*" | sort | while read stream; do echo -n "$stream: "; redis-cli XLEN "$stream"; done
+
+ total=0; count=0; for stream in $(redis-cli --scan --pattern "tick_*"); do len=$(redis-cli XLEN "$stream" | tail -1); total=$((total + len)); count=$((count + 1)); done; echo "Total streams: $count"; echo "Total messages: $total"; echo "Average per stream: $((total / count))"
+```
+
+
+### Deploy to Azure Aks
 
 Build and push to Azure Container Registry (ACR uses native ARM64 builders):
 
@@ -19,8 +82,7 @@ az aks nodepool add   --cluster-name khredis   --name v6   --resource-group redi
 
 
 ```bash
-
-az acr build --registry kharc --image redis-client:0.11-amd64 --platform linux/amd64 .
+az acr build --registry kharc --image redis-streamer:0.1-amd64 --platform linux/amd64 .
 
 ```
 

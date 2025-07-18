@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-query-api
+  labels:
+    app: redis-query-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redis-query-api
+  template:
+    metadata:
+      labels:
+        app: redis-query-api
+    spec:
+      serviceAccountName: redis-query-api-sa
+      containers:
+      - name: redis-query-api
+        image: redis-query-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: http
+        env:
+        - name: REDIS_HOST
+          valueFrom:
+            secretKeyRef:
+              name: redis-secrets
+              key: redis-host
+        - name: REDIS_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: redis-secrets
+              key: redis-username
+        - name: AZURE_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: redis-secrets
+              key: azure-client-id
+        - name: REDIS_POOL_SIZE
+          value: "20"
+        - name: REDIS_MAX_RETRIES
+          value: "3"
+        - name: REDIS_DIAL_TIMEOUT
+          value: "5s"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+      nodeSelector:
+        kubernetes.azure.com/agentpool: khrediscompute
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-query-api-service
+  labels:
+    app: redis-query-api
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8081
+    protocol: TCP
+    name: http
+  selector:
+    app: redis-query-api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-query-api-sa
+  annotations:
+    azure.workload.identity/client-id: "7303e014-4009-403f-b170-83ef57374e21"
+  labels:
+    azure.workload.identity/use: "true"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: redis-query-api-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Content-Type"
+spec:
+  rules:
+  - host: redis-api.example.com  # Replace with your domain
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: redis-query-api-service
+            port:
+              number: 80

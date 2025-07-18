@@ -1,8 +1,8 @@
 {
   "tradeId": "{{.TradeId}}",
-  "symbol": "AAPL",
-  "exchange": "NASDAQ",
-  "currency": "USD",
+  "symbol": "{{.Symbol}}",
+  "exchange": "LSE",
+  "currency": "GBP",
   "timestamp": "{{.Timestamp}}",
   "marketSector": "TECHNOLOGY",
   "volatility": 0.2450,

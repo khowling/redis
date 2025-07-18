@@ -5,7 +5,7 @@ metadata:
   labels:
     app: redis-stream-app
 spec:
-  replicas: 1
+  replicas: 5
   selector:
     matchLabels:
       app: redis-stream-app
@@ -26,7 +26,7 @@ spec:
         effect: NoSchedule
       containers:
       - name: redis-client
-        image: kharc.azurecr.io/redis-client:0.18-amd64 # 5000-message batches for maximum throughput
+        image: kharc.azurecr.io/redis-streamer:0.2 # 5000-message batches for maximum throughput
         ports:
         - containerPort: 8080
         env:

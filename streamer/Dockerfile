@@ -36,7 +36,8 @@ WORKDIR /app
 COPY --from=builder /app/main .
 
 # Copy test data file
-COPY --from=builder /app/test_message.json .
+COPY test_message.json .
+COPY uk_symbols.txt .
 
 # Change ownership to non-root user
 RUN chown -R appuser:appgroup /app

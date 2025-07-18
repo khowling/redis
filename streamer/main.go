@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"text/template"
@@ -419,6 +420,7 @@ func retryOperation(ctx context.Context, operation func() error, maxRetries int,
 type TradeTemplate struct {
 	TradeId   string
 	Timestamp string
+	Symbol    string // Added symbol field for random UK symbols
 }
 
 // generateTradeId generates a unique trade ID
@@ -428,14 +430,45 @@ func generateTradeId() string {
 		rand.Intn(1000000000))
 }
 
+// loadUKSymbols loads UK stock symbols from file
+func loadUKSymbols(symbolsPath string) ([]string, error) {
+	content, err := os.ReadFile(symbolsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read symbols file: %w", err)
+	}
+
+	// Split by lines and filter out empty lines
+	lines := strings.Split(string(content), "\n")
+	var symbols []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			symbols = append(symbols, line)
+		}
+	}
+
+	if len(symbols) == 0 {
+		return nil, fmt.Errorf("no symbols found in file")
+	}
+
+	return symbols, nil
+}
+
 // MessageTemplate holds the parsed template for reuse
 type MessageTemplate struct {
-	template *template.Template
-	baseData map[string]interface{}
+	template  *template.Template
+	baseData  map[string]interface{}
+	ukSymbols []string // Cache of UK stock symbols
 }
 
 // loadMessageTemplate loads and parses the trade message template once
 func loadMessageTemplate(templatePath string) (*MessageTemplate, error) {
+	// Load UK symbols first
+	ukSymbols, err := loadUKSymbols("uk_symbols.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load UK symbols: %w", err)
+	}
+
 	// Read the template file once
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
@@ -452,6 +485,7 @@ func loadMessageTemplate(templatePath string) (*MessageTemplate, error) {
 	sampleData := TradeTemplate{
 		TradeId:   "SAMPLE",
 		Timestamp: "SAMPLE",
+		Symbol:    "SAMPLE",
 	}
 
 	var buf bytes.Buffer
@@ -466,17 +500,22 @@ func loadMessageTemplate(templatePath string) (*MessageTemplate, error) {
 	}
 
 	return &MessageTemplate{
-		template: tmpl,
-		baseData: baseData,
+		template:  tmpl,
+		baseData:  baseData,
+		ukSymbols: ukSymbols,
 	}, nil
 }
 
 // generateMessage creates a new message using the cached template
 func (mt *MessageTemplate) generateMessage() (map[string]interface{}, error) {
+	// Select random UK symbol
+	randomSymbol := mt.ukSymbols[rand.Intn(len(mt.ukSymbols))]
+
 	// Create template data with unique values
 	data := TradeTemplate{
 		TradeId:   generateTradeId(),
 		Timestamp: time.Now().Format(time.RFC3339Nano),
+		Symbol:    randomSymbol,
 	}
 
 	// Execute template with new data
@@ -697,29 +736,53 @@ func (c *AzureRedisClient) batchProcessor(ctx context.Context, messageChan <-cha
 	}
 }
 
-// flushBatch sends a batch of messages to Redis
+// flushBatch sends a batch of messages to Redis, grouped by symbol into separate streams
 func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage, stats *StreamingStats, workerID int) {
 	if len(batch) == 0 {
 		return
 	}
 
-	_, err := c.AddBatchToStream(ctx, "trade_events", batch, &StreamAddOptions{
-		MaxLen:      2600000, // Allow ~5GB of data (2.6M messages * ~2KB each)
-		Approximate: true,
-	})
+	// Group messages by symbol for separate streams
+	symbolBatches := make(map[string][]StreamMessage)
 
-	if err != nil {
-		stats.Update(0, 0, 1)
-		c.logger.WithFields(logrus.Fields{
-			"worker": workerID,
-			"error":  err,
-		}).Error("Failed to flush batch")
-	} else {
-		stats.Update(int64(len(batch)), 1, 0)
+	for _, message := range batch {
+		// Extract symbol from message fields
+		if symbolInterface, exists := message.Fields["symbol"]; exists {
+			if symbol, ok := symbolInterface.(string); ok {
+				streamName := fmt.Sprintf("tick_%s", symbol)
+				symbolBatches[streamName] = append(symbolBatches[streamName], message)
+			}
+		}
 	}
+
+	// Send each symbol batch to its respective stream
+	totalErrors := int64(0)
+	totalProcessed := int64(0)
+
+	for streamName, symbolBatch := range symbolBatches {
+		_, err := c.AddBatchToStream(ctx, streamName, symbolBatch, &StreamAddOptions{
+			MaxLen:      130000, // ~5GB total divided by ~80 symbols = ~130k messages per symbol
+			Approximate: true,
+		})
+
+		if err != nil {
+			totalErrors++
+			c.logger.WithFields(logrus.Fields{
+				"worker": workerID,
+				"stream": streamName,
+				"count":  len(symbolBatch),
+				"error":  err,
+			}).Error("Failed to flush symbol batch")
+		} else {
+			totalProcessed += int64(len(symbolBatch))
+		}
+	}
+
+	// Update stats with total processed and errors
+	stats.Update(totalProcessed, int64(len(symbolBatches)), totalErrors)
 }
 
-// streamLengthMonitor monitors the stream length periodically
+// streamLengthMonitor monitors the total length across all symbol streams
 func (c *AzureRedisClient) streamLengthMonitor(ctx context.Context, stats *StreamingStats) {
 	ticker := time.NewTicker(5 * time.Second) // Check stream length every 5 seconds
 	defer ticker.Stop()
@@ -729,18 +792,32 @@ func (c *AzureRedisClient) streamLengthMonitor(ctx context.Context, stats *Strea
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Get stream info to retrieve length
-			streamInfo, err := c.GetStreamInfo(ctx, "trade_events")
+			// Get list of all streams that match our pattern
+			keys, err := c.client.Keys(ctx, "tick_*").Result()
 			if err != nil {
-				// Log error but continue monitoring
 				c.logger.WithFields(logrus.Fields{
 					"error": err,
-				}).Warn("Failed to get stream info")
+				}).Warn("Failed to get stream keys")
 				continue
 			}
 
-			// Update stats with current stream length
-			stats.UpdateStreamLength(streamInfo.Length)
+			// Sum up lengths from all symbol streams
+			totalLength := int64(0)
+			for _, streamName := range keys {
+				streamInfo, err := c.GetStreamInfo(ctx, streamName)
+				if err != nil {
+					// Log error but continue with other streams
+					c.logger.WithFields(logrus.Fields{
+						"stream": streamName,
+						"error":  err,
+					}).Debug("Failed to get stream info")
+					continue
+				}
+				totalLength += streamInfo.Length
+			}
+
+			// Update stats with total length across all streams
+			stats.UpdateStreamLength(totalLength)
 		}
 	}
 }
@@ -763,11 +840,19 @@ func (c *AzureRedisClient) statsReporter(ctx context.Context, stats *StreamingSt
 			return
 		case <-ticker.C:
 			messages, batches, rate, errors, streamLength := stats.GetStats()
-			// Print statistics with pod identification
-			fmt.Printf("📊 [%s] Pod: %s | Messages: %d | Batches: %d | Rate: %.2f msg/sec | Errors: %d | Stream: %d | Uptime: %s\n",
+
+			// Get stream count for additional info
+			keys, err := c.client.Keys(ctx, "tick_*").Result()
+			streamCount := len(keys)
+			if err != nil {
+				streamCount = 0 // If we can't get keys, show 0
+			}
+
+			// Print statistics with pod identification and stream info
+			fmt.Printf("📊 [%s] Pod: %s | Messages: %d | Batches: %d | Rate: %.2f msg/sec | Errors: %d | Streams: %d | Total Messages: %d | Uptime: %s\n",
 				time.Now().Format("15:04:05"),
 				hostname,
-				messages, batches, rate, errors, streamLength,
+				messages, batches, rate, errors, streamCount, streamLength,
 				time.Since(stats.StartTime).Round(time.Second),
 			)
 		}
