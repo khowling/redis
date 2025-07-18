@@ -95,6 +95,24 @@ func (cm *ConfigManager) LoadRedisConfig() *RedisConfig {
 	if poolSize := getEnvIntOrDefault("REDIS_POOL_SIZE", 0); poolSize > 0 {
 		config.PoolSize = poolSize
 	}
+	if readTimeout := getEnvDurationOrDefault("REDIS_READ_TIMEOUT", 0); readTimeout > 0 {
+		config.ReadTimeout = readTimeout
+	}
+	if writeTimeout := getEnvDurationOrDefault("REDIS_WRITE_TIMEOUT", 0); writeTimeout > 0 {
+		config.WriteTimeout = writeTimeout
+	}
+	if poolTimeout := getEnvDurationOrDefault("REDIS_POOL_TIMEOUT", 0); poolTimeout > 0 {
+		config.PoolTimeout = poolTimeout
+	}
+	if minIdleConns := getEnvIntOrDefault("REDIS_MIN_IDLE_CONNS", 0); minIdleConns > 0 {
+		config.MinIdleConns = minIdleConns
+	}
+	if idleTimeout := getEnvDurationOrDefault("REDIS_IDLE_TIMEOUT", 0); idleTimeout > 0 {
+		config.IdleTimeout = idleTimeout
+	}
+	if maxConnAge := getEnvDurationOrDefault("REDIS_MAX_CONN_AGE", 0); maxConnAge > 0 {
+		config.MaxConnAge = maxConnAge
+	}
 
 	return config
 }

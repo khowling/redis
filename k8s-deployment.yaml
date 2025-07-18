@@ -5,7 +5,7 @@ metadata:
   labels:
     app: redis-stream-app
 spec:
-  replicas: 5
+  replicas: 1
   selector:
     matchLabels:
       app: redis-stream-app
@@ -16,9 +16,17 @@ spec:
         azure.workload.identity/use: "true"
     spec:
       serviceAccountName: redis-stream-app-sa
+      # Schedule on high-performance F8as_v6 nodes
+      nodeSelector:
+        vm-type: f8as-v6
+      tolerations:
+      - key: workload
+        operator: Equal
+        value: compute
+        effect: NoSchedule
       containers:
       - name: redis-client
-        image: kharc.azurecr.io/redis-client:0.9-arm64-with-health # Optimized for AKS performance + health checks
+        image: kharc.azurecr.io/redis-client:0.18-amd64 # 5000-message batches for maximum throughput
         ports:
         - containerPort: 8080
         env:
@@ -54,6 +62,20 @@ spec:
               name: redis-stream-app-config
               key: REDIS_DIAL_TIMEOUT
         
+        # Additional Redis performance tuning for 200k+ msg/sec throughput (5000 msg batches)
+        - name: REDIS_READ_TIMEOUT
+          value: "5s"             # Increased for 5000-message batches to prevent I/O timeouts
+        - name: REDIS_WRITE_TIMEOUT
+          value: "5s"             # Increased for 5000-message batches to prevent I/O timeouts
+        - name: REDIS_POOL_TIMEOUT
+          value: "1s"             # Increased pool acquisition timeout
+        - name: REDIS_IDLE_TIMEOUT
+          value: "15m"            # Longer connection reuse
+        - name: REDIS_MAX_CONN_AGE
+          value: "60m"            # Longer connection lifecycle
+        - name: REDIS_MIN_IDLE_CONNS
+          value: "50"             # More warm connections (was 25)
+        
         # Azure Managed Identity Configuration (secrets, keep as env vars)
         - name: AZURE_CLIENT_ID
           value: "7303e014-4009-403f-b170-83ef57374e21" # User Managed Identity Object ID (required for Azure Redis auth)
@@ -63,11 +85,24 @@ spec:
         # Managed Identity Object ID for Redis ACL (used as username in Redis connection)
         - name: REDIS_USERNAME
           value: "7303e014-4009-403f-b170-83ef57374e21" # Object ID of your managed identity
+        
+        # Go runtime optimization for 200k+ msg/sec throughput
+        - name: GOMAXPROCS
+          value: "3"              # Match CPU allocation
+        - name: GOGC
+          value: "400"            # Much less aggressive GC (was 200)
+        - name: GOMEMLIMIT
+          value: "9GiB"           # Memory limit
+        - name: GODEBUG
+          value: "gctrace=0,madvdontneed=1,scavtrace=0"  # Optimize memory behavior
 
         resources:
           requests:
-            memory: "128Mi"
-            cpu: "1000m"
+            memory: "10Gi"        # High memory for caching and buffers
+            cpu: "3000m"          # 3 dedicated physical cores
+          limits:
+            memory: "12Gi"        # Allow some memory bursting
+            cpu: "3500m"          # Allow slight CPU bursting but stay within node capacity
         
         # Health checks
         livenessProbe:
@@ -149,6 +184,6 @@ data:
   ENVIRONMENT: "production"
   REDIS_USE_AAD: "true"
   REDIS_MAX_RETRIES: "3"
-  REDIS_POOL_SIZE: "50"
-  REDIS_DIAL_TIMEOUT: "5s"
+  REDIS_POOL_SIZE: "300"          # Massive pool for 200k+ throughput (was 150)
+  REDIS_DIAL_TIMEOUT: "1s"        # Fast connection establishment
   REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"

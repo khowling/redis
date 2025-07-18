@@ -428,28 +428,60 @@ func generateTradeId() string {
 		rand.Intn(1000000000))
 }
 
-// loadTradeTemplate loads and processes the trade message template
-func loadTradeTemplate(templatePath string) (map[string]interface{}, error) {
-	// Read the template file
+// MessageTemplate holds the parsed template for reuse
+type MessageTemplate struct {
+	template *template.Template
+	baseData map[string]interface{}
+}
+
+// loadMessageTemplate loads and parses the trade message template once
+func loadMessageTemplate(templatePath string) (*MessageTemplate, error) {
+	// Read the template file once
 	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read template file: %w", err)
 	}
 
-	// Create template data
-	data := TradeTemplate{
-		TradeId:   generateTradeId(),
-		Timestamp: time.Now().Format(time.RFC3339Nano),
-	}
-
-	// Parse and execute template
+	// Parse template once
 	tmpl, err := template.New("trade").Parse(string(templateContent))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse template: %w", err)
 	}
 
+	// Parse the template with sample data to get the base structure
+	sampleData := TradeTemplate{
+		TradeId:   "SAMPLE",
+		Timestamp: "SAMPLE",
+	}
+
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
+	if err := tmpl.Execute(&buf, sampleData); err != nil {
+		return nil, fmt.Errorf("failed to execute sample template: %w", err)
+	}
+
+	// Parse JSON to get base structure
+	var baseData map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &baseData); err != nil {
+		return nil, fmt.Errorf("failed to parse sample JSON: %w", err)
+	}
+
+	return &MessageTemplate{
+		template: tmpl,
+		baseData: baseData,
+	}, nil
+}
+
+// generateMessage creates a new message using the cached template
+func (mt *MessageTemplate) generateMessage() (map[string]interface{}, error) {
+	// Create template data with unique values
+	data := TradeTemplate{
+		TradeId:   generateTradeId(),
+		Timestamp: time.Now().Format(time.RFC3339Nano),
+	}
+
+	// Execute template with new data
+	var buf bytes.Buffer
+	if err := mt.template.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("failed to execute template: %w", err)
 	}
 
@@ -526,6 +558,14 @@ func (c *AzureRedisClient) StartHighPerformanceStreaming(ctx context.Context, co
 		StartTime: time.Now(),
 	}
 
+	// Load message template once at startup
+	messageTemplate, err := loadMessageTemplate("test_message.json")
+	if err != nil {
+		fmt.Printf("❌ Failed to load message template: %v\n", err)
+		return
+	}
+	fmt.Printf("✅ Message template loaded successfully\n")
+
 	// Create a cancelable context for coordinating shutdown
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -534,8 +574,8 @@ func (c *AzureRedisClient) StartHighPerformanceStreaming(ctx context.Context, co
 	messageChan := make(chan StreamMessage, config.BatchSize*config.WorkerCount)
 	doneChan := make(chan struct{})
 
-	// Start message generator
-	go c.messageGenerator(ctx, messageChan, config, stats)
+	// Start message generator with cached template
+	go c.messageGenerator(ctx, messageChan, config, stats, messageTemplate)
 
 	// Start stream length monitor
 	go c.streamLengthMonitor(ctx, stats)
@@ -554,8 +594,8 @@ func (c *AzureRedisClient) StartHighPerformanceStreaming(ctx context.Context, co
 	c.handleShutdown(ctx, cancel, config, &wg, doneChan)
 }
 
-// messageGenerator continuously generates messages
-func (c *AzureRedisClient) messageGenerator(ctx context.Context, messageChan chan<- StreamMessage, config *StreamingConfig, stats *StreamingStats) {
+// messageGenerator continuously generates messages using cached template
+func (c *AzureRedisClient) messageGenerator(ctx context.Context, messageChan chan<- StreamMessage, config *StreamingConfig, stats *StreamingStats, messageTemplate *MessageTemplate) {
 	defer close(messageChan) // Close channel when generator exits
 
 	var rateLimiter <-chan time.Time
@@ -587,8 +627,8 @@ func (c *AzureRedisClient) messageGenerator(ctx context.Context, messageChan cha
 				}
 			}
 
-			// Generate message
-			tradeData, err := loadTradeTemplate("test_message.json")
+			// Generate message using cached template (much faster!)
+			tradeData, err := messageTemplate.generateMessage()
 			if err != nil {
 				stats.Update(0, 0, 1)
 				continue
@@ -664,7 +704,7 @@ func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage
 	}
 
 	_, err := c.AddBatchToStream(ctx, "trade_events", batch, &StreamAddOptions{
-		MaxLen:      10000,
+		MaxLen:      2600000, // Allow ~5GB of data (2.6M messages * ~2KB each)
 		Approximate: true,
 	})
 
@@ -710,6 +750,12 @@ func (c *AzureRedisClient) statsReporter(ctx context.Context, stats *StreamingSt
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// Get pod/hostname for identification
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -717,9 +763,10 @@ func (c *AzureRedisClient) statsReporter(ctx context.Context, stats *StreamingSt
 			return
 		case <-ticker.C:
 			messages, batches, rate, errors, streamLength := stats.GetStats()
-			// Print statistics directly to stdout (not through logger) to avoid log level issues
-			fmt.Printf("📊 [%s] Messages: %d | Batches: %d | Rate: %.2f msg/sec | Errors: %d | Stream: %d | Uptime: %s\n",
+			// Print statistics with pod identification
+			fmt.Printf("📊 [%s] Pod: %s | Messages: %d | Batches: %d | Rate: %.2f msg/sec | Errors: %d | Stream: %d | Uptime: %s\n",
 				time.Now().Format("15:04:05"),
+				hostname,
 				messages, batches, rate, errors, streamLength,
 				time.Since(stats.StartTime).Round(time.Second),
 			)
@@ -790,9 +837,9 @@ func main() {
 
 	// Configure high-performance streaming for AKS
 	streamingConfig := NewStreamingConfig()
-	streamingConfig.BatchSize = 100                       // Larger batches for better throughput
-	streamingConfig.FlushInterval = 50 * time.Millisecond // Less frequent flushes, larger batches
-	streamingConfig.WorkerCount = 16                      // More workers for AKS resources
+	streamingConfig.BatchSize = 5000                      // 10x increase for maximum throughput
+	streamingConfig.FlushInterval = 25 * time.Millisecond // Was 50ms
+	streamingConfig.WorkerCount = 32                      // More workers for AKS resources
 	streamingConfig.MessageRate = 0                       // Unlimited rate
 	streamingConfig.RunDuration = 0                       // Run indefinitely
 

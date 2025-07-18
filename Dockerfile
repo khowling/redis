@@ -16,8 +16,8 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the application - cross-compile for ARM64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o main .
+# Build the application (use GOOS=linux GOARCH=arm64 for ARM64 architecture)
+RUN CGO_ENABLED=0 go build -o main .
 
 # Final stage
 FROM alpine:latest

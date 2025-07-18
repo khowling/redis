@@ -4,24 +4,27 @@ A robust Go client for Azure Managed Redis that provides secure stream operation
 
 ## Features
 
-- **Azure AD Authentication**## Build
+- **Azure AD Authentication**
+
+## Build
 
 Build and push to Azure Container Registry (ACR uses native ARM64 builders):
 
-```bash
-# Native ARM64 build - no cross-compilation needed
-az acr build --registry kharc --image redis-client:0.3-arm64-native --platform linux/arm64 .
+We will be deploying on `Standard_F8as_v6`, the v6 cores are a great price/performance
 
-# Alternative with version tag
-az acr build --registry kharc --image redis-client:latest --platform linux/arm64 .
-```s managed identity for secure authentication
-- **Stream Operations**: Add single messages, batch messages, and retrieve stream information
-- **Retry Logic**: Exponential backoff retry mechanism for transient failures
-- **Connection Pooling**: Optimized connection management for better performance
-- **Comprehensive Logging**: Structured logging with configurable levels
-- **Error Handling**: Robust error handling with context-aware timeouts
-- **TLS Support**: Secure connections with TLS encryption
-- **Production Ready**: Includes monitoring, graceful shutdown, and production patterns
+this is the command to add the nodepool
+```bash
+az aks nodepool add   --cluster-name khredis   --name v6   --resource-group redis  --node-count 3   --node-vm-size Standard_F8as_v6   --enable-cluster-autoscaler   --min-count 1   --max-count 5   --node-taints workload=compute:NoSchedule   --labels workload=compute   --labels vm-type=f8as-v6
+```
+
+
+```bash
+
+az acr build --registry kharc --image redis-client:0.11-amd64 --platform linux/amd64 .
+
+```
+
+
 
 ## Prerequisites
 
