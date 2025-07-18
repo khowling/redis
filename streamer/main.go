@@ -698,17 +698,23 @@ func (c *AzureRedisClient) batchProcessor(ctx context.Context, messageChan <-cha
 	for {
 		select {
 		case <-ctx.Done():
-			// Context cancelled, flush remaining messages gracefully
+			// Context cancelled, flush remaining messages with timeout
 			if len(batch) > 0 {
-				c.flushBatch(context.Background(), batch, stats, workerID) // Use background context for final flush
+				// Create a shutdown timeout context
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				c.flushBatch(shutdownCtx, batch, stats, workerID)
 			}
 			return
 
 		case message, ok := <-messageChan:
 			if !ok {
-				// Channel closed, flush remaining messages and exit
+				// Channel closed, flush remaining messages with timeout
 				if len(batch) > 0 {
-					c.flushBatch(context.Background(), batch, stats, workerID) // Use background context for final flush
+					// Create a shutdown timeout context
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					c.flushBatch(shutdownCtx, batch, stats, workerID)
 				}
 				return
 			}
@@ -736,7 +742,7 @@ func (c *AzureRedisClient) batchProcessor(ctx context.Context, messageChan <-cha
 	}
 }
 
-// flushBatch sends a batch of messages to Redis, grouped by symbol into separate streams
+// flushBatch sends a batch of messages to Redis streams with timestamp indexing for fast queries
 func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage, stats *StreamingStats, workerID int) {
 	if len(batch) == 0 {
 		return
@@ -749,33 +755,109 @@ func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage
 		// Extract symbol from message fields
 		if symbolInterface, exists := message.Fields["symbol"]; exists {
 			if symbol, ok := symbolInterface.(string); ok {
-				streamName := fmt.Sprintf("tick_%s", symbol)
-				symbolBatches[streamName] = append(symbolBatches[streamName], message)
+				symbolBatches[symbol] = append(symbolBatches[symbol], message)
 			}
 		}
 	}
 
-	// Send each symbol batch to its respective stream
+	// Process each symbol batch with hybrid approach (streams + timestamp index)
 	totalErrors := int64(0)
 	totalProcessed := int64(0)
 
-	for streamName, symbolBatch := range symbolBatches {
-		_, err := c.AddBatchToStream(ctx, streamName, symbolBatch, &StreamAddOptions{
-			MaxLen:      130000, // ~5GB total divided by ~80 symbols = ~130k messages per symbol
-			Approximate: true,
-		})
+	for symbol, symbolBatch := range symbolBatches {
+		streamName := fmt.Sprintf("tick_%s", symbol)
 
+		// Phase 1: Add messages to stream using pipeline
+		streamPipe := c.client.Pipeline()
+		var streamCmds []*redis.StringCmd
+
+		for _, message := range symbolBatch {
+			args := &redis.XAddArgs{
+				Stream: streamName,
+				Values: message.Fields,
+				MaxLen: 130000, // ~130k messages per symbol stream
+				Approx: true,
+			}
+			streamCmds = append(streamCmds, streamPipe.XAdd(ctx, args))
+		}
+
+		// Execute stream pipeline with timeout context for shutdown
+		execCtx := ctx
+		if ctx.Err() != nil {
+			// During shutdown, create a timeout context to allow graceful completion
+			var cancel context.CancelFunc
+			execCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+		}
+
+		_, err := streamPipe.Exec(execCtx)
 		if err != nil {
 			totalErrors++
-			c.logger.WithFields(logrus.Fields{
-				"worker": workerID,
-				"stream": streamName,
-				"count":  len(symbolBatch),
-				"error":  err,
-			}).Error("Failed to flush symbol batch")
-		} else {
-			totalProcessed += int64(len(symbolBatch))
+			// Only log as error if it's not a context cancellation during shutdown
+			if ctx.Err() == nil {
+				c.logger.WithFields(logrus.Fields{
+					"worker": workerID,
+					"stream": streamName,
+					"count":  len(symbolBatch),
+					"error":  err,
+				}).Error("Failed to flush symbol batch to stream")
+			}
+			continue
 		}
+
+		// Phase 2: Add timestamp index entries for fast time-based queries
+		indexPipe := c.client.Pipeline()
+		indexKey := fmt.Sprintf("ts_idx_%s", symbol)
+		indexEntries := 0
+
+		for i, cmd := range streamCmds {
+			if cmd.Err() == nil {
+				streamID := cmd.Val()
+
+				// Extract timestamp from message for indexing
+				if timestampInterface, exists := symbolBatch[i].Fields["timestamp"]; exists {
+					if timestampStr, ok := timestampInterface.(string); ok {
+						if ts, err := time.Parse(time.RFC3339Nano, timestampStr); err == nil {
+							// Add to sorted set: score = timestamp_millis, member = stream_id
+							// Use timeout context for shutdown operations
+							indexCtx := context.Background()
+							if ctx.Err() != nil {
+								var cancel context.CancelFunc
+								indexCtx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+								defer cancel()
+							}
+
+							indexPipe.ZAdd(indexCtx, indexKey, redis.Z{
+								Score:  float64(ts.UnixMilli()),
+								Member: streamID,
+							})
+							indexEntries++
+
+							// Set TTL on timestamp index (optional - for data retention)
+							if indexEntries == 1 { // Set TTL once per batch
+								indexPipe.Expire(indexCtx, indexKey, 7*24*time.Hour) // 7 days retention
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Execute timestamp index pipeline (non-blocking for performance)
+		if indexEntries > 0 {
+			go func(pipe redis.Pipeliner, streamName string, count int) {
+				_, indexErr := pipe.Exec(context.Background())
+				if indexErr != nil {
+					c.logger.WithFields(logrus.Fields{
+						"stream": streamName,
+						"count":  count,
+						"error":  indexErr,
+					}).Warn("Failed to update timestamp index")
+				}
+			}(indexPipe, streamName, indexEntries)
+		}
+
+		totalProcessed += int64(len(symbolBatch))
 	}
 
 	// Update stats with total processed and errors
@@ -792,25 +874,40 @@ func (c *AzureRedisClient) streamLengthMonitor(ctx context.Context, stats *Strea
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Check if context is cancelled before making Redis calls
+			if ctx.Err() != nil {
+				return
+			}
+
 			// Get list of all streams that match our pattern
 			keys, err := c.client.Keys(ctx, "tick_*").Result()
 			if err != nil {
-				c.logger.WithFields(logrus.Fields{
-					"error": err,
-				}).Warn("Failed to get stream keys")
+				// Don't log context cancelled errors during shutdown
+				if ctx.Err() == nil {
+					c.logger.WithFields(logrus.Fields{
+						"error": err,
+					}).Warn("Failed to get stream keys")
+				}
 				continue
 			}
 
 			// Sum up lengths from all symbol streams
 			totalLength := int64(0)
 			for _, streamName := range keys {
+				// Check context again before each stream info call
+				if ctx.Err() != nil {
+					return
+				}
+
 				streamInfo, err := c.GetStreamInfo(ctx, streamName)
 				if err != nil {
-					// Log error but continue with other streams
-					c.logger.WithFields(logrus.Fields{
-						"stream": streamName,
-						"error":  err,
-					}).Debug("Failed to get stream info")
+					// Don't log context cancelled errors during shutdown
+					if ctx.Err() == nil {
+						c.logger.WithFields(logrus.Fields{
+							"stream": streamName,
+							"error":  err,
+						}).Debug("Failed to get stream info")
+					}
 					continue
 				}
 				totalLength += streamInfo.Length
@@ -841,11 +938,13 @@ func (c *AzureRedisClient) statsReporter(ctx context.Context, stats *StreamingSt
 		case <-ticker.C:
 			messages, batches, rate, errors, streamLength := stats.GetStats()
 
-			// Get stream count for additional info
-			keys, err := c.client.Keys(ctx, "tick_*").Result()
-			streamCount := len(keys)
-			if err != nil {
-				streamCount = 0 // If we can't get keys, show 0
+			// Get stream count for additional info - only if context is not cancelled
+			streamCount := 0
+			if ctx.Err() == nil {
+				keys, err := c.client.Keys(ctx, "tick_*").Result()
+				if err == nil {
+					streamCount = len(keys)
+				}
 			}
 
 			// Print statistics with pod identification and stream info
@@ -888,7 +987,7 @@ func (c *AzureRedisClient) handleShutdown(ctx context.Context, cancel context.Ca
 	select {
 	case <-done:
 		fmt.Println("✅ All workers finished gracefully")
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second): // Increased timeout for large batches
 		fmt.Println("⚠️  Timeout waiting for workers, forcing shutdown")
 	}
 

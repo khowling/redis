@@ -26,7 +26,7 @@ spec:
         effect: NoSchedule
       containers:
       - name: redis-client
-        image: kharc.azurecr.io/redis-streamer:0.2 # 5000-message batches for maximum throughput
+        image: kharc.azurecr.io/redis-streamer:0.3 # 5000-message batches for maximum throughput
         ports:
         - containerPort: 8080
         env:
