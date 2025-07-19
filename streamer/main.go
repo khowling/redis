@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,9 +26,12 @@ import (
 
 // AzureRedisClient represents the Azure Redis client with stream operations
 type AzureRedisClient struct {
-	client *redis.Client
-	logger *logrus.Logger
-	config *RedisConfig
+	client        redis.Cmdable // Use interface to support both single and cluster clients
+	clusterClient *redis.ClusterClient
+	singleClient  *redis.Client
+	logger        *logrus.Logger
+	config        *RedisConfig
+	isCluster     bool
 }
 
 // RedisConfig holds configuration for Azure Redis connection
@@ -46,6 +50,8 @@ type RedisConfig struct {
 	PoolTimeout   time.Duration
 	IdleTimeout   time.Duration
 	IdleCheckFreq time.Duration
+	IsCluster     bool
+	MaxLen        int64 // Maximum messages per stream
 }
 
 // StreamMessage represents a message to be added to a Redis stream
@@ -92,9 +98,19 @@ func NewRedisConfig() *RedisConfig {
 
 	// For localhost, use standard Redis port and disable AAD
 	useAAD := true
+	isCluster := false
 	if host == "localhost" {
 		port = 6379    // Standard Redis port for localhost
 		useAAD = false // Disable Azure AD for localhost
+		isCluster = false
+	} else {
+		// For Azure Redis Cache, check if cluster mode should be enabled
+		// Default to false, can be enabled via environment variable
+		if os.Getenv("REDIS_ENABLE_CLUSTER") == "true" {
+			isCluster = true
+		} else {
+			isCluster = false // Default to single mode
+		}
 	}
 
 	// Parse pool size from environment with default
@@ -121,6 +137,14 @@ func NewRedisConfig() *RedisConfig {
 		}
 	}
 
+	// Parse stream max length from environment with default
+	maxLen := int64(2000000) // Default: 2 million messages per stream
+	if maxLenStr := os.Getenv("REDIS_STREAM_MAXLEN"); maxLenStr != "" {
+		if ml, err := strconv.ParseInt(maxLenStr, 10, 64); err == nil && ml > 0 {
+			maxLen = ml
+		}
+	}
+
 	return &RedisConfig{
 		Host:          host,
 		Port:          port,
@@ -136,6 +160,8 @@ func NewRedisConfig() *RedisConfig {
 		PoolTimeout:   2 * time.Second,  // Reduced timeout for faster failover
 		IdleTimeout:   3 * time.Minute,  // Reduced idle timeout
 		IdleCheckFreq: 30 * time.Second, // Less frequent idle checks
+		IsCluster:     isCluster,
+		MaxLen:        maxLen, // Configurable stream max length
 	}
 }
 
@@ -148,45 +174,84 @@ func NewAzureRedisClient(config *RedisConfig) (*AzureRedisClient, error) {
 		return nil, fmt.Errorf("redis host is required")
 	}
 
-	// Create Redis client options
-	opts := &redis.Options{
-		Addr:            fmt.Sprintf("%s:%d", config.Host, config.Port),
-		Username:        config.Username,
-		MaxRetries:      config.MaxRetries,
-		DialTimeout:     config.DialTimeout,
-		ReadTimeout:     config.ReadTimeout,
-		WriteTimeout:    config.WriteTimeout,
-		PoolSize:        config.PoolSize,
-		MinIdleConns:    config.MinIdleConns,
-		ConnMaxLifetime: config.MaxConnAge,
-		PoolTimeout:     config.PoolTimeout,
-		ConnMaxIdleTime: config.IdleTimeout,
+	client := &AzureRedisClient{
+		logger:    logger,
+		config:    config,
+		isCluster: config.IsCluster,
 	}
 
-	// Only use TLS for non-localhost connections
-	if config.Host != "localhost" {
-		opts.TLSConfig = &tls.Config{ServerName: config.Host}
-	}
-
-	// Use Azure AD authentication with managed identity if enabled
-	if config.UseAAD {
-		provider, err := createManagedIdentityProvider()
-		if err != nil {
-			return nil, fmt.Errorf("failed to create managed identity provider: %w", err)
+	if config.IsCluster {
+		// Create cluster client
+		clusterOpts := &redis.ClusterOptions{
+			Addrs:           []string{fmt.Sprintf("%s:%d", config.Host, config.Port)},
+			Username:        config.Username,
+			MaxRetries:      config.MaxRetries,
+			DialTimeout:     config.DialTimeout,
+			ReadTimeout:     config.ReadTimeout,
+			WriteTimeout:    config.WriteTimeout,
+			PoolSize:        config.PoolSize,
+			MinIdleConns:    config.MinIdleConns,
+			ConnMaxLifetime: config.MaxConnAge,
+			PoolTimeout:     config.PoolTimeout,
+			ConnMaxIdleTime: config.IdleTimeout,
 		}
-		opts.StreamingCredentialsProvider = provider
-		// Don't set password when using streaming credentials
-		opts.Password = ""
-	}
 
-	client := redis.NewClient(opts)
+		// Only use TLS for non-localhost connections
+		if config.Host != "localhost" {
+			clusterOpts.TLSConfig = &tls.Config{ServerName: config.Host}
+		}
+
+		// Use Azure AD authentication with managed identity if enabled
+		if config.UseAAD {
+			provider, err := createManagedIdentityProvider()
+			if err != nil {
+				return nil, fmt.Errorf("failed to create managed identity provider: %w", err)
+			}
+			clusterOpts.StreamingCredentialsProvider = provider
+		}
+
+		client.clusterClient = redis.NewClusterClient(clusterOpts)
+		client.client = client.clusterClient
+	} else {
+		// Create single client
+		opts := &redis.Options{
+			Addr:            fmt.Sprintf("%s:%d", config.Host, config.Port),
+			Username:        config.Username,
+			MaxRetries:      config.MaxRetries,
+			DialTimeout:     config.DialTimeout,
+			ReadTimeout:     config.ReadTimeout,
+			WriteTimeout:    config.WriteTimeout,
+			PoolSize:        config.PoolSize,
+			MinIdleConns:    config.MinIdleConns,
+			ConnMaxLifetime: config.MaxConnAge,
+			PoolTimeout:     config.PoolTimeout,
+			ConnMaxIdleTime: config.IdleTimeout,
+		}
+
+		// Only use TLS for non-localhost connections
+		if config.Host != "localhost" {
+			opts.TLSConfig = &tls.Config{ServerName: config.Host}
+		}
+
+		// Use Azure AD authentication with managed identity if enabled
+		if config.UseAAD {
+			provider, err := createManagedIdentityProvider()
+			if err != nil {
+				return nil, fmt.Errorf("failed to create managed identity provider: %w", err)
+			}
+			opts.StreamingCredentialsProvider = provider
+		}
+
+		client.singleClient = redis.NewClient(opts)
+		client.client = client.singleClient
+	}
 
 	// Test connection with retry logic
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	err := retryOperation(ctx, func() error {
-		return client.Ping(ctx).Err()
+		return client.client.Ping(ctx).Err()
 	}, 3, time.Second)
 
 	if err != nil {
@@ -194,13 +259,13 @@ func NewAzureRedisClient(config *RedisConfig) (*AzureRedisClient, error) {
 	}
 
 	// Print connection success directly to stdout so it's always visible
-	fmt.Printf("✅ Successfully connected to Redis at %s:%d\n", config.Host, config.Port)
+	mode := "single"
+	if config.IsCluster {
+		mode = "cluster"
+	}
+	fmt.Printf("✅ Successfully connected to Redis %s at %s:%d\n", mode, config.Host, config.Port)
 
-	return &AzureRedisClient{
-		client: client,
-		logger: logger,
-		config: config,
-	}, nil
+	return client, nil
 }
 
 // createManagedIdentityProvider creates a managed identity credentials provider
@@ -385,7 +450,13 @@ func (c *AzureRedisClient) GetStreamInfo(ctx context.Context, streamName string)
 // Close closes the Redis client connection
 func (c *AzureRedisClient) Close() error {
 	c.logger.Info("Closing Redis client connection")
-	return c.client.Close()
+	if c.clusterClient != nil {
+		return c.clusterClient.Close()
+	}
+	if c.singleClient != nil {
+		return c.singleClient.Close()
+	}
+	return nil
 }
 
 // retryOperation implements exponential backoff retry logic
@@ -775,7 +846,7 @@ func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage
 			args := &redis.XAddArgs{
 				Stream: streamName,
 				Values: message.Fields,
-				MaxLen: 130000, // ~130k messages per symbol stream
+				MaxLen: c.config.MaxLen, // Use configurable max length
 				Approx: true,
 			}
 			streamCmds = append(streamCmds, streamPipe.XAdd(ctx, args))
@@ -845,16 +916,20 @@ func (c *AzureRedisClient) flushBatch(ctx context.Context, batch []StreamMessage
 
 		// Execute timestamp index pipeline (non-blocking for performance)
 		if indexEntries > 0 {
-			go func(pipe redis.Pipeliner, streamName string, count int) {
-				_, indexErr := pipe.Exec(context.Background())
+			go func(pipe redis.Pipeliner, streamName string, count int, shutdownCtx context.Context) {
+				// Use the shutdown context instead of Background to respect cancellation
+				_, indexErr := pipe.Exec(shutdownCtx)
 				if indexErr != nil {
-					c.logger.WithFields(logrus.Fields{
-						"stream": streamName,
-						"count":  count,
-						"error":  indexErr,
-					}).Warn("Failed to update timestamp index")
+					// Only log as warning if it's not due to context cancellation during shutdown
+					if shutdownCtx.Err() == nil {
+						c.logger.WithFields(logrus.Fields{
+							"stream": streamName,
+							"count":  count,
+							"error":  indexErr,
+						}).Warn("Failed to update timestamp index")
+					}
 				}
-			}(indexPipe, streamName, indexEntries)
+			}(indexPipe, streamName, indexEntries, ctx)
 		}
 
 		totalProcessed += int64(len(symbolBatch))

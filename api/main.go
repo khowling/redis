@@ -73,7 +73,7 @@ func (s *APIServer) GetMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Parse query parameters
 	query := r.URL.Query()
-	
+
 	// Get symbols (required)
 	symbolsParam := query.Get("symbols")
 	if symbolsParam == "" {
@@ -89,14 +89,14 @@ func (s *APIServer) GetMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := query.Get("start")
 	endTime := query.Get("end")
 	limitParam := query.Get("limit")
-	
-	// Parse limit (default: 100, max: 10000)
-	limit := 100
+
+	// Parse limit (default: 1000, max: 100000)
+	limit := 1000
 	if limitParam != "" {
 		if parsedLimit, err := strconv.Atoi(limitParam); err == nil {
 			limit = parsedLimit
-			if limit > 10000 {
-				limit = 10000 // Cap at 10k messages
+			if limit > 100000 {
+				limit = 100000 // Cap at 100k messages
 			}
 			if limit < 1 {
 				limit = 1
@@ -132,7 +132,7 @@ func (s *APIServer) GetMessages(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// queryStreams queries multiple Redis streams and returns messages
+// queryStreams queries multiple Redis streams using timestamp indexes for fast time-based queries
 func (s *APIServer) queryStreams(ctx context.Context, symbols []string, startTime, endTime string, limit int) ([]StreamMessageResponse, error) {
 	var allMessages []StreamMessageResponse
 	messagesPerSymbol := limit / len(symbols)
@@ -142,7 +142,8 @@ func (s *APIServer) queryStreams(ctx context.Context, symbols []string, startTim
 
 	for _, symbol := range symbols {
 		streamName := fmt.Sprintf("tick_%s", symbol)
-		
+		indexKey := fmt.Sprintf("ts_idx_%s", symbol)
+
 		// Check if stream exists
 		exists, err := s.redisClient.client.Exists(ctx, streamName).Result()
 		if err != nil {
@@ -154,51 +155,62 @@ func (s *APIServer) queryStreams(ctx context.Context, symbols []string, startTim
 			continue
 		}
 
-		// Build XRANGE arguments
-		start := "-" // From beginning
-		end := "+"   // To end
-		
-		// Parse timestamps if provided
-		if startTime != "" {
-			if ts, err := parseTimestamp(startTime); err == nil {
-				start = fmt.Sprintf("%d-0", ts)
-			}
-		}
-		if endTime != "" {
-			if ts, err := parseTimestamp(endTime); err == nil {
-				end = fmt.Sprintf("%d-0", ts)
-			}
-		}
+		var streamIDs []string
 
-		// Query stream with XREVRANGE for most recent messages
-		var messages []redis.XMessage
-		if startTime == "" && endTime == "" {
-			// Get most recent messages
-			result, err := s.redisClient.client.XRevRangeN(ctx, streamName, "+", "-", int64(messagesPerSymbol)).Result()
-			if err != nil {
-				log.Printf("Error querying stream %s: %v", streamName, err)
-				continue
+		// Use timestamp index for fast time-based queries when timestamps are provided
+		if startTime != "" || endTime != "" {
+			// Parse timestamps to milliseconds
+			var startMs, endMs int64
+			startMs = 0           // Default to beginning
+			endMs = 9999999999999 // Default to far future
+
+			if startTime != "" {
+				if ts, err := parseTimestamp(startTime); err == nil {
+					startMs = ts
+				}
 			}
-			messages = result
+			if endTime != "" {
+				if ts, err := parseTimestamp(endTime); err == nil {
+					endMs = ts
+				}
+			}
+
+			// Use ZRANGEBYSCORE on timestamp index for O(log N) query performance
+			indexResults, err := s.redisClient.client.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
+				Min:   fmt.Sprintf("%d", startMs),
+				Max:   fmt.Sprintf("%d", endMs),
+				Count: int64(messagesPerSymbol),
+			}).Result()
+
+			if err != nil {
+				log.Printf("Error querying timestamp index %s: %v", indexKey, err)
+				// Fallback to stream scan if index query fails
+				streamIDs = s.fallbackStreamQuery(ctx, streamName, startTime, endTime, messagesPerSymbol)
+			} else {
+				streamIDs = indexResults
+				log.Printf("Found %d stream IDs in timestamp range for %s using index", len(streamIDs), symbol)
+			}
 		} else {
-			// Get messages in time range
-			result, err := s.redisClient.client.XRangeN(ctx, streamName, start, end, int64(messagesPerSymbol)).Result()
+			// For recent messages without time filter, get from timestamp index (newest first)
+			indexResults, err := s.redisClient.client.ZRevRange(ctx, indexKey, 0, int64(messagesPerSymbol-1)).Result()
 			if err != nil {
-				log.Printf("Error querying stream %s: %v", streamName, err)
-				continue
+				log.Printf("Error getting recent messages from index %s: %v", indexKey, err)
+				// Fallback to stream scan if index query fails
+				streamIDs = s.fallbackStreamQuery(ctx, streamName, "", "", messagesPerSymbol)
+			} else {
+				streamIDs = indexResults
+				log.Printf("Found %d recent stream IDs for %s using index", len(streamIDs), symbol)
 			}
-			messages = result
 		}
 
-		// Convert to response format
-		for _, msg := range messages {
-			allMessages = append(allMessages, StreamMessageResponse{
-				ID:        msg.ID,
-				Stream:    streamName,
-				Symbol:    symbol,
-				Timestamp: extractTimestamp(msg.Values),
-				Fields:    msg.Values,
-			})
+		// Fetch actual messages from stream using the stream IDs from index
+		if len(streamIDs) > 0 {
+			messages, err := s.fetchMessagesFromStream(ctx, streamName, streamIDs, symbol)
+			if err != nil {
+				log.Printf("Error fetching messages from stream %s: %v", streamName, err)
+				continue
+			}
+			allMessages = append(allMessages, messages...)
 		}
 	}
 
@@ -265,17 +277,17 @@ func (s *APIServer) writeError(w http.ResponseWriter, statusCode int, error, mes
 // HealthCheck handles GET /health endpoint
 func (s *APIServer) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	// Test Redis connection
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	err := s.redisClient.client.Ping(ctx).Err()
 	if err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "unhealthy",
-			"redis": "disconnected",
+			"redis":  "disconnected",
 			"error":  err.Error(),
 		})
 		return
@@ -314,9 +326,9 @@ func (s *APIServer) GetStreams(w http.ResponseWriter, r *http.Request) {
 
 		symbol := strings.TrimPrefix(streamName, "tick_")
 		streams = append(streams, map[string]interface{}{
-			"stream": streamName,
-			"symbol": symbol,
-			"length": info.Length,
+			"stream":      streamName,
+			"symbol":      symbol,
+			"length":      info.Length,
 			"first_entry": info.FirstEntry.ID,
 			"last_entry":  info.LastEntry.ID,
 		})
@@ -329,6 +341,93 @@ func (s *APIServer) GetStreams(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+}
+
+// fallbackStreamQuery performs traditional stream scanning when index is unavailable
+func (s *APIServer) fallbackStreamQuery(ctx context.Context, streamName, startTime, endTime string, limit int) []string {
+	// Build XRANGE arguments
+	start := "-" // From beginning
+	end := "+"   // To end
+
+	// Parse timestamps if provided
+	if startTime != "" {
+		if ts, err := parseTimestamp(startTime); err == nil {
+			start = fmt.Sprintf("%d-0", ts)
+		}
+	}
+	if endTime != "" {
+		if ts, err := parseTimestamp(endTime); err == nil {
+			end = fmt.Sprintf("%d-0", ts)
+		}
+	}
+
+	// Query stream with XRANGE or XREVRANGE
+	var messages []redis.XMessage
+	var err error
+
+	if startTime == "" && endTime == "" {
+		// Get most recent messages
+		messages, err = s.redisClient.client.XRevRangeN(ctx, streamName, "+", "-", int64(limit)).Result()
+	} else {
+		// Get messages in time range
+		messages, err = s.redisClient.client.XRangeN(ctx, streamName, start, end, int64(limit)).Result()
+	}
+
+	if err != nil {
+		log.Printf("Error in fallback stream query %s: %v", streamName, err)
+		return []string{}
+	}
+
+	// Extract stream IDs
+	streamIDs := make([]string, len(messages))
+	for i, msg := range messages {
+		streamIDs[i] = msg.ID
+	}
+
+	return streamIDs
+}
+
+// fetchMessagesFromStream retrieves specific messages from stream by their IDs
+func (s *APIServer) fetchMessagesFromStream(ctx context.Context, streamName string, streamIDs []string, symbol string) ([]StreamMessageResponse, error) {
+	var messages []StreamMessageResponse
+
+	// Use pipeline for efficient batch retrieval of multiple messages
+	pipe := s.redisClient.client.Pipeline()
+	var commands []*redis.XMessageSliceCmd
+
+	// For each stream ID, query the specific message
+	for _, streamID := range streamIDs {
+		// XRANGE with same start and end gives us the specific message
+		cmd := pipe.XRange(ctx, streamName, streamID, streamID)
+		commands = append(commands, cmd)
+	}
+
+	// Execute pipeline
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute message fetch pipeline: %w", err)
+	}
+
+	// Process results
+	for _, cmd := range commands {
+		if cmd.Err() != nil {
+			log.Printf("Error fetching message: %v", cmd.Err())
+			continue
+		}
+
+		cmdMessages := cmd.Val()
+		for _, msg := range cmdMessages {
+			messages = append(messages, StreamMessageResponse{
+				ID:        msg.ID,
+				Stream:    streamName,
+				Symbol:    symbol,
+				Timestamp: extractTimestamp(msg.Values),
+				Fields:    msg.Values,
+			})
+		}
+	}
+
+	return messages, nil
 }
 
 func main() {
@@ -345,7 +444,7 @@ func main() {
 
 	// Setup routes
 	r := mux.NewRouter()
-	
+
 	// API routes
 	r.HandleFunc("/api/messages", apiServer.GetMessages).Methods("GET", "OPTIONS")
 	r.HandleFunc("/api/streams", apiServer.GetStreams).Methods("GET", "OPTIONS")
@@ -376,6 +475,6 @@ func main() {
 	log.Printf("📖 API Documentation available at: http://localhost%s", port)
 	log.Printf("🏥 Health check available at: http://localhost%s/health", port)
 	log.Printf("📊 Example: http://localhost%s/api/messages?symbols=AAL,BP&limit=10", port)
-	
+
 	log.Fatal(http.ListenAndServe(port, r))
 }

@@ -5,7 +5,7 @@ metadata:
   labels:
     app: redis-query-api
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: redis-query-api
@@ -15,35 +15,81 @@ spec:
         app: redis-query-api
     spec:
       serviceAccountName: redis-query-api-sa
+      # Schedule on high-performance F8as_v6 nodes
+      nodeSelector:
+        vm-type: f8as-v6
+      tolerations:
+      - key: workload
+        operator: Equal
+        value: compute
+        effect: NoSchedule
       containers:
       - name: redis-query-api
-        image: redis-query-api:latest
+        image: kharc.azurecr.io/redis-api:0.2  # Updated with timestamp index support
         imagePullPolicy: Always
         ports:
         - containerPort: 8081
           name: http
         env:
-        - name: REDIS_HOST
+        - name: ENVIRONMENT
           valueFrom:
-            secretKeyRef:
-              name: redis-secrets
-              key: redis-host
-        - name: REDIS_USERNAME
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: ENVIRONMENT
+        - name: REDIS_USE_AAD
           valueFrom:
-            secretKeyRef:
-              name: redis-secrets
-              key: redis-username
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_USE_AAD
+        - name: REDIS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_ENDPOINT
+        - name: REDIS_MAX_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_MAX_RETRIES
+        - name: REDIS_POOL_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_POOL_SIZE
+        - name: REDIS_DIAL_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_DIAL_TIMEOUT
+        
+        # Stream configuration
+        - name: REDIS_STREAM_MAXLEN
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_STREAM_MAXLEN
+        
+        # Azure Managed Identity Configuration (from ConfigMap)
         - name: AZURE_CLIENT_ID
           valueFrom:
-            secretKeyRef:
-              name: redis-secrets
-              key: azure-client-id
-        - name: REDIS_POOL_SIZE
-          value: "20"
-        - name: REDIS_MAX_RETRIES
-          value: "3"
-        - name: REDIS_DIAL_TIMEOUT
-          value: "5s"
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: AZURE_CLIENT_ID
+        - name: AZURE_TENANT_ID
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: AZURE_TENANT_ID
+        - name: REDIS_USERNAME
+          valueFrom:
+            configMapKeyRef:
+              name: redis-api-app-config
+              key: REDIS_USERNAME
+        
+        # Redis cluster mode configuration
+        - name: REDIS_ENABLE_CLUSTER
+          value: "true"              # Enable cluster mode for Azure Redis
+        
         resources:
           requests:
             memory: "256Mi"
@@ -68,8 +114,7 @@ spec:
           timeoutSeconds: 3
           successThreshold: 1
           failureThreshold: 3
-      nodeSelector:
-        kubernetes.azure.com/agentpool: khrediscompute
+
 ---
 apiVersion: v1
 kind: Service
@@ -96,25 +141,20 @@ metadata:
   labels:
     azure.workload.identity/use: "true"
 ---
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: redis-query-api-ingress
-  annotations:
-    kubernetes.io/ingress.class: "nginx"
-    nginx.ingress.kubernetes.io/rewrite-target: /
-    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
-    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS"
-    nginx.ingress.kubernetes.io/cors-allow-headers: "Content-Type"
-spec:
-  rules:
-  - host: redis-api.example.com  # Replace with your domain
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: redis-query-api-service
-            port:
-              number: 80
+  name: redis-api-app-config
+data:
+  ENVIRONMENT: "production"
+  REDIS_USE_AAD: "true"
+  REDIS_MAX_RETRIES: "3"
+  REDIS_POOL_SIZE: "300"          # Massive pool for 200k+ throughput (was 150)
+  REDIS_DIAL_TIMEOUT: "1s"        # Fast connection establishment
+  REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"
+  REDIS_STREAM_MAXLEN: "2000000"  # 2 million messages per stream
+  
+  # Azure Managed Identity Configuration
+  AZURE_CLIENT_ID: "7303e014-4009-403f-b170-83ef57374e21"  # User Managed Identity Object ID
+  AZURE_TENANT_ID: "MngEnvMCAP134668.onmicrosoft.com"      # Azure Tenant ID
+  REDIS_USERNAME: "7303e014-4009-403f-b170-83ef57374e21"   # Object ID for Redis ACL
