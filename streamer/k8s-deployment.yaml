@@ -204,9 +204,9 @@ data:
   REDIS_MAX_RETRIES: "3"
   REDIS_POOL_SIZE: "300"          # Massive pool for 200k+ throughput (was 150)
   REDIS_DIAL_TIMEOUT: "1s"        # Fast connection establishment
-  REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"
   REDIS_STREAM_MAXLEN: "2000000"  # 2 million messages per stream
   
+  REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"  
   # Azure Managed Identity Configuration
   AZURE_CLIENT_ID: "7303e014-4009-403f-b170-83ef57374e21"  # User Managed Identity Object ID
   AZURE_TENANT_ID: "MngEnvMCAP134668.onmicrosoft.com"      # Azure Tenant ID

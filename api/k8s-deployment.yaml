@@ -25,7 +25,7 @@ spec:
         effect: NoSchedule
       containers:
       - name: redis-query-api
-        image: kharc.azurecr.io/redis-api:0.2  # Updated with timestamp index support
+        image: kharc.azurecr.io/redis-api:0.5  # Updated with timestamp index support
         imagePullPolicy: Always
         ports:
         - containerPort: 8081
@@ -92,11 +92,11 @@ spec:
         
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "10Gi"
+            cpu: "5000m"
           limits:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "12Gi"
+            cpu: "10000m"
         livenessProbe:
           httpGet:
             path: /health

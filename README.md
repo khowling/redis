@@ -1,6 +1,6 @@
 # Redis Streaming Platform
 
-A high-performance Redis streaming platform for UK stock market data with REST API access.
+A high-performance Redis streaming platform for financial market data with realtime REST API access.
 
 ## 🏗️ Project Structure
 
@@ -12,19 +12,21 @@ redis/
 │   ├── health.go      # Health monitoring
 │   ├── go.mod         # Module: redis-streamer
 │   ├── test_message.json
-│   └── uk_symbols.txt # 87 UK stock symbols
+│   ├── uk_symbols.txt # 600 UK stock symbols
+│   ├── k8s-*.yaml         # Kubernetes deployment files
+│   └── Dockerfile         # Container image
 ├── api/               # REST API server (reads from Redis)
 │   ├── main.go        # HTTP API server
 │   ├── redis.go       # Redis client for API
 │   └── go.mod         # Module: redis-query-api
+│   ├── k8s-*.yaml         # Kubernetes deployment files
+│   └── Dockerfile         # Container image
 ├── scripts/           # Monitoring and utility scripts
-├── k8s-*.yaml         # Kubernetes deployment files
 ├── docker-compose.yml # Docker setup
-├── Dockerfile         # Container image
 └── README.md          # This file
 ```
 
-## 🚀 Quick Start
+## 🚀 Quick Start (localhost, requires redis installed)
 
 ### 1. Start Redis Streaming (Producer)
 ```bash
@@ -50,14 +52,7 @@ curl "http://localhost:8081/api/messages?symbols=AAL,BP&limit=10"
 curl http://localhost:8081/health
 ```
 
-## Build
-
-Locally
-
-```bash
-go build -o redis-client .
-
-```
+### 4. Examine Redis keys
 
 test
 ```bash
@@ -69,24 +64,7 @@ test
 ```
 
 
-### Deploy to Azure Aks
-
-Build and push to Azure Container Registry (ACR uses native ARM64 builders):
-
-We will be deploying on `Standard_F8as_v6`, the v6 cores are a great price/performance
-
-this is the command to add the nodepool
-```bash
-az aks nodepool add   --cluster-name khredis   --name v6   --resource-group redis  --node-count 3   --node-vm-size Standard_F8as_v6   --enable-cluster-autoscaler   --min-count 1   --max-count 5   --node-taints workload=compute:NoSchedule   --labels workload=compute   --labels vm-type=f8as-v6
-```
-
-
-```bash
-az acr build --registry kharc --image redis-streamer:0.1-amd64 --platform linux/amd64 .
-
-```
-
-
+# Deploy to Azure Aks
 
 ## Prerequisites
 
@@ -94,19 +72,8 @@ az acr build --registry kharc --image redis-streamer:0.1-amd64 --platform linux/
 - Azure Redis Cache instance
 - Azure AD authentication configured (Managed Identity or Service Principal)
 
-## Installation
 
-```bash
-go mod init your-project-name
-go get github.com/Azure/azure-sdk-for-go/sdk/azcore
-go get github.com/Azure/azure-sdk-for-go/sdk/azidentity
-go get github.com/go-redis/redis/v8
-go get github.com/sirupsen/logrus
-```
-
-## Configuration
-
-### Environment Variables
+### Configuration
 
 Set the following environment variables:
 
@@ -123,184 +90,73 @@ This client uses Azure AD authentication by default. Ensure your application has
 2. **For Service Principal**: Create a service principal and assign the appropriate Redis permissions
 3. **For Development**: Use Azure CLI authentication: `az login`
 
-## Usage
 
-### Basic Usage
 
-```go
-package main
 
-import (
-    "context"
-    "log"
-    "time"
-)
+### Build and push to Azure Container Registry:
 
-func main() {
-    // Create configuration
-    config := NewRedisConfig()
-    config.Host = "your-redis-instance.redis.cache.windows.net"
-    config.Username = "your-username"
+We will be deploying on `Standard_F8as_v6`, the v6 cores are a great price/performance
 
-    // Create client
-    client, err := NewAzureRedisClient(config)
-    if err != nil {
-        log.Fatal("Failed to create Redis client:", err)
-    }
-    defer client.Close()
-
-    ctx := context.Background()
-
-    // Add a message to a stream
-    message := StreamMessage{
-        Fields: map[string]interface{}{
-            "user_id":    "12345",
-            "action":     "login",
-            "timestamp":  time.Now().Unix(),
-            "ip_address": "192.168.1.1",
-        },
-    }
-
-    messageID, err := client.AddToStream(ctx, "user_events", message, &StreamAddOptions{
-        MaxLen:      1000,
-        Approximate: true,
-    })
-    if err != nil {
-        log.Printf("Error: %v", err)
-        return
-    }
-    
-    log.Printf("Message added with ID: %s", messageID)
-}
+This is the command to add the nodepool
+```bash
+az aks nodepool add   --cluster-name khredis   --name v6   --resource-group redis  --node-count 3   --node-vm-size Standard_F8as_v6   --enable-cluster-autoscaler   --min-count 1   --max-count 5   --node-taints workload=compute:NoSchedule   --labels workload=compute   --labels vm-type=f8as-v6
 ```
 
-### Batch Operations
 
-```go
-// Add multiple messages efficiently
-messages := []StreamMessage{
-    {
-        Fields: map[string]interface{}{
-            "order_id": "order_001",
-            "status":   "pending",
-            "amount":   99.99,
-        },
-    },
-    {
-        Fields: map[string]interface{}{
-            "order_id": "order_002",
-            "status":   "confirmed",
-            "amount":   149.99,
-        },
-    },
-}
-
-messageIDs, err := client.AddBatchToStream(ctx, "orders", messages, &StreamAddOptions{
-    MaxLen:      5000,
-    Approximate: true,
-})
+```bash
+az acr build --registry kharc --image redis-streamer:0.1-amd64 --platform linux/amd64 ./streamer
+az acr build --registry kharc --image redis-api:0.1-amd64 --platform linux/amd64 ./api
 ```
 
-### Stream Information
+### Config map
 
-```go
-// Get stream information
-info, err := client.GetStreamInfo(ctx, "user_events")
-if err != nil {
-    log.Printf("Error: %v", err)
-    return
-}
-
-fmt.Printf("Stream Length: %d\n", info.Length)
-fmt.Printf("First Entry: %s\n", info.FirstEntry.ID)
-fmt.Printf("Last Entry: %s\n", info.LastEntry.ID)
+Update
+```
+  REDIS_ENDPOINT: "khredis.westeurope.redis.azure.net:10000"  
+  # Azure Managed Identity Configuration
+  AZURE_CLIENT_ID: "xxx"  # User Managed Identity Object ID
+  AZURE_TENANT_ID: "xxx"      # Azure Tenant ID
+  REDIS_USERNAME: "xxx"   # Object ID for Redis ACL
 ```
 
-## Configuration Options
+```bash
+kubectl apply -f ./streamer/k8s-deployment.yaml 
+kubectl apply -f ./api/k8s-deployment.yaml 
+```
 
-The `RedisConfig` struct supports the following options:
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| Host | string | - | Redis host (required) |
-| Port | int | 6380 | Redis port |
-| Username | string | - | Redis username |
-| UseAAD | bool | true | Use Azure AD authentication |
-| MaxRetries | int | 3 | Maximum retry attempts |
-| DialTimeout | time.Duration | 5s | Connection timeout |
-| ReadTimeout | time.Duration | 3s | Read operation timeout |
-| WriteTimeout | time.Duration | 3s | Write operation timeout |
-| PoolSize | int | 10 | Connection pool size |
-| MinIdleConns | int | 5 | Minimum idle connections |
-| MaxConnAge | time.Duration | 30m | Maximum connection age |
-| PoolTimeout | time.Duration | 4s | Pool timeout |
-| IdleTimeout | time.Duration | 5m | Idle connection timeout |
-
-## Stream Operations
-
-### Adding Messages
-
-The client supports three ways to add messages:
-
-1. **Single Message**: `AddToStream(ctx, streamName, message, options)`
-2. **Batch Messages**: `AddBatchToStream(ctx, streamName, messages, options)`
-3. **Custom ID**: Set the `ID` field in `StreamMessage`
-
-### Stream Options
-
-Use `StreamAddOptions` to control stream behavior:
-
-- `MaxLen`: Maximum number of messages to retain
-- `Approximate`: Use approximate trimming for better performance
-
-## Error Handling
-
-The client implements comprehensive error handling:
-
-- **Retry Logic**: Exponential backoff for transient failures
-- **Context Support**: Respects context cancellation and timeouts
-- **Detailed Logging**: Structured logging with error context
-- **Connection Recovery**: Automatic reconnection on connection failures
-
-## Production Considerations
-
-### Security
-
-- Uses Azure AD authentication by default
-- Supports managed identity for secure credential management
-- Enables TLS encryption for all connections
-- Never hardcodes credentials in source code
-
-### Performance
-
-- Connection pooling for optimal resource usage
-- Batch operations for high-throughput scenarios
-- Configurable timeouts and retry policies
-- Efficient memory usage with streaming operations
+Scale
+```bash
+kubectl scale deployment redis-stream-app --replicas=3
+kubectl scale deployment redis-query-api --replicas=3
+```
 
 ### Monitoring
 
-- Structured logging with configurable levels
-- Metrics collection for stream operations
-- Error tracking and alerting capabilities
-- Health check endpoints support
+```
+k logs -l app=redis-stream-app -f
+```
 
-### Best Practices
+### Testing
 
-1. **Use Managed Identity**: Preferred authentication method in Azure
-2. **Configure Timeouts**: Set appropriate timeouts for your use case
-3. **Monitor Stream Size**: Use `MaxLen` to prevent unbounded growth
-4. **Batch Operations**: Use batch operations for high-volume scenarios
-5. **Handle Errors**: Implement proper error handling and alerting
-6. **Use Contexts**: Always use context for cancellation and timeouts
 
-## Examples
+```
+curl -s 'http://9.163.170.3/api/messages?symbols=AAL,BP,WPP,TSCO,DGE,GSK&limit=100000'
 
-Run the examples to see the client in action:
+curl -s 'http://9.163.170.3/api/messages?symbols=AAL,BP,WPP,TSCO,DGE,GSK&limit=1&pinStart=true'
+
+curl -s 'http://9.163.170.3/api/messages?symbols=AAL,BP,WPP,TSCO,DGE,GSK&limit=1&pinStart=false'
+
+ab -n 10000 -c 10  'http://9.163.170.3/api/messages?symbols=AAL,BP,WPP,TSCO,DGE,GSK&limit=10000' 
+```
+
+
+
+### Utilities
 
 ```bash
-go run main.go examples.go
+ az redisenterprise flush --name khredis --resource-group <your-resource-group>
 ```
+
 
 ## Contributing
 
